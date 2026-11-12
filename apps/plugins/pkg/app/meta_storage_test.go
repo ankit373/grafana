@@ -2,10 +2,14 @@ package app
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/grafana/authlib/authn"
+	authtypes "github.com/grafana/authlib/types"
 	"github.com/grafana/grafana-app-sdk/logging"
 	"github.com/grafana/grafana-app-sdk/resource"
 	"github.com/stretchr/testify/assert"
@@ -281,3 +285,107 @@ func (m *mockResourceClient) ListInto(ctx context.Context, namespace string, opt
 func testContext(namespace string) context.Context {
 	return k8srequest.WithNamespace(context.Background(), namespace)
 }
+
+func TestMetaStorage_List_FailureLogLevel(t *testing.T) {
+	provider := meta.NewProviderManager(&errorByIDProvider{
+		errs: map[string]error{
+			"missing-plugin": meta.ErrMetaNotFound,
+			"broken-plugin":  errors.New("conversion failed"),
+		},
+	})
+	mockClient := &mockResourceClient{
+		listFunc: func(_ context.Context, _ string, _ resource.ListOptions) (resource.ListObject, error) {
+			return &pluginsv0alpha1.PluginList{
+				Items: []pluginsv0alpha1.Plugin{
+					{ObjectMeta: metav1.ObjectMeta{Name: "missing-plugin", Namespace: "default"}, Spec: pluginsv0alpha1.PluginSpec{Id: "missing-plugin", Version: "1.0.0"}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "broken-plugin", Namespace: "default"}, Spec: pluginsv0alpha1.PluginSpec{Id: "broken-plugin", Version: "1.0.0"}},
+				},
+			}, nil
+		},
+	}
+
+	tests := []struct {
+		name         string
+		originCaller string
+		want         map[string]string
+	}{
+		{
+			name:         "logs not found at debug level for Advisor",
+			originCaller: "advisor.grafana.app",
+			want:         map[string]string{"missing-plugin": "debug", "broken-plugin": "warn"},
+		},
+		{
+			name:         "logs not found at warn level for other callers",
+			originCaller: "stack-state-service",
+			want:         map[string]string{"missing-plugin": "warn", "broken-plugin": "warn"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := &recordingLogger{levels: map[string]string{}}
+			storage := NewMetaStorage(logger, provider, func(_ context.Context) (*pluginsv0alpha1.PluginClient, error) {
+				return pluginsv0alpha1.NewPluginClient(mockClient), nil
+			})
+			ctx := authtypes.WithAuthInfo(testContext("default"), serviceAuthInfo{extra: map[string][]string{
+				authn.ServiceIdentityKey:          {"hosted-grafana"},
+				authn.InnermostServiceIdentityKey: {tt.originCaller},
+			}})
+
+			_, err := storage.List(ctx, nil)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, logger.failures())
+		})
+	}
+}
+
+// errorByIDProvider returns the configured error for a plugin ID.
+type errorByIDProvider struct {
+	errs map[string]error
+}
+
+func (e *errorByIDProvider) Name() string {
+	return "error-by-id"
+}
+
+func (e *errorByIDProvider) GetMeta(_ context.Context, ref meta.PluginRef) (*meta.Result, error) {
+	return nil, e.errs[ref.ID]
+}
+
+// serviceAuthInfo is an auth info that only exposes its extra fields.
+type serviceAuthInfo struct {
+	authtypes.AuthInfo
+	extra map[string][]string
+}
+
+func (a serviceAuthInfo) GetExtra() map[string][]string { return a.extra }
+
+// recordingLogger records the level of each "Failed to fetch metadata for plugin" message by plugin ID.
+type recordingLogger struct {
+	logging.NoOpLogger
+	mu     sync.Mutex
+	levels map[string]string
+}
+
+func (l *recordingLogger) record(level, msg string, args ...any) {
+	if msg != "Failed to fetch metadata for plugin" {
+		return
+	}
+	for i := 0; i+1 < len(args); i += 2 {
+		if args[i] == "pluginId" {
+			l.mu.Lock()
+			l.levels[args[i+1].(string)] = level
+			l.mu.Unlock()
+		}
+	}
+}
+
+func (l *recordingLogger) failures() map[string]string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.levels
+}
+
+func (l *recordingLogger) Debug(msg string, args ...any)                { l.record("debug", msg, args...) }
+func (l *recordingLogger) Warn(msg string, args ...any)                 { l.record("warn", msg, args...) }
+func (l *recordingLogger) With(_ ...any) logging.Logger                 { return l }
+func (l *recordingLogger) WithContext(_ context.Context) logging.Logger { return l }
